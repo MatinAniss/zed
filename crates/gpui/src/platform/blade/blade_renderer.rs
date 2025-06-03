@@ -334,7 +334,7 @@ impl BladeRenderer {
         let surface_config = gpu::SurfaceConfig {
             size: config.size,
             usage: gpu::TextureUsage::TARGET,
-            display_sync: gpu::DisplaySync::Recent,
+            display_sync: gpu::DisplaySync::Block,
             color_space: gpu::ColorSpace::Linear,
             allow_exclusive_full_screen: false,
             transparent: config.transparent,
