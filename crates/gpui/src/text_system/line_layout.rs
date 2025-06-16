@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use super::LineWrapper;
+use super::{InlineBox, LineWrapper};
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -216,6 +216,9 @@ pub struct WrappedLineLayout {
     /// The boundaries at which the line was wrapped
     pub wrap_boundaries: SmallVec<[WrapBoundary; 1]>,
 
+    /// The inline boxes contained in the line
+    pub inline_boxes: SmallVec<[InlineBox; 1]>,
+
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
 }
@@ -246,9 +249,33 @@ impl WrappedLineLayout {
     /// The size of the whole wrapped text, for the given line_height.
     /// can span multiple lines if there are multiple wrap boundaries.
     pub fn size(&self, line_height: Pixels) -> Size<Pixels> {
+        let mut height = px(0.);
+        let mut inline_boxes = self.inline_boxes.iter().peekable();
+
+        for boundry in &self.wrap_boundaries {
+            let mut max_height = line_height;
+
+            while let Some(inline_box) = inline_boxes.peek() {
+                if boundry.glyph_ix < inline_box.glyph_ix {
+                    break;
+                }
+
+                max_height = max_height.max(inline_box.size.height);
+                inline_boxes.next();
+            }
+
+            height += max_height;
+        }
+
+        let mut max_end_height = line_height;
+        while let Some(inline_box) = inline_boxes.next() {
+            max_end_height = max_end_height.max(inline_box.size.height);
+        }
+        height += max_end_height;
+
         Size {
             width: self.width(),
-            height: line_height * (self.wrap_boundaries.len() + 1),
+            height,
         }
     }
 
@@ -369,17 +396,33 @@ impl WrappedLineLayout {
                 let glyph = &run.glyphs[wrap_boundary.glyph_ix];
                 glyph.index
             })
-            .chain([self.len()])
-            .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
+            .chain([self.len()]);
+        let mut inline_boxes = self.inline_boxes.iter().peekable();
+
+        let mut line_y = px(0.);
+        for line_end_ix in line_end_indices {
+            let mut max_line_y = line_height;
+            while let Some(inline_box) = inline_boxes.peek() {
+                if inline_box.glyph_ix > line_end_ix {
+                    break;
+                }
+
+                max_line_y = max_line_y.max(inline_box.size.height);
+                inline_boxes.next();
+            }
+            line_y += max_line_y;
+
             if index < line_start_ix {
                 break;
             } else if index > line_end_ix {
                 line_start_ix = line_end_ix;
                 continue;
             } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
+                let line_start_x = if line_start_ix == 0 {
+                    px(0.)
+                } else {
+                    self.unwrapped_layout.x_for_index(line_start_ix)
+                };
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
                 return Some(point(x, line_y));
             }
@@ -470,6 +513,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        inline_boxes: Option<&[InlineBox]>,
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
     ) -> Arc<WrappedLineLayout>
@@ -481,6 +525,7 @@ impl LineLayoutCache {
             text: text.as_ref(),
             font_size,
             runs,
+            inline_boxes: inline_boxes.unwrap_or_default(),
             wrap_width,
         } as &dyn AsCacheKeyRef;
 
@@ -500,7 +545,12 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs);
+            let unwrapped_layout = self.layout_line::<&SharedString>(
+                &text,
+                font_size,
+                runs,
+                inline_boxes.unwrap_or_default(),
+            );
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -509,12 +559,14 @@ impl LineLayoutCache {
             let layout = Arc::new(WrappedLineLayout {
                 unwrapped_layout,
                 wrap_boundaries,
+                inline_boxes: SmallVec::from(inline_boxes.unwrap_or_default()),
                 wrap_width,
             });
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
+                inline_boxes: SmallVec::from(inline_boxes.unwrap_or_default()),
                 wrap_width,
             });
 
@@ -533,6 +585,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        inline_boxes: &[InlineBox],
     ) -> Arc<LineLayout>
     where
         Text: AsRef<str>,
@@ -542,6 +595,7 @@ impl LineLayoutCache {
             text: text.as_ref(),
             font_size,
             runs,
+            inline_boxes,
             wrap_width: None,
         } as &dyn AsCacheKeyRef;
 
@@ -557,14 +611,45 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let layout = Arc::new(
-                self.platform_text_system
-                    .layout_line(&text, font_size, runs),
-            );
+            let mut inline_boxes_iter = inline_boxes.iter().peekable();
+            let mut inline_boxes_width = px(0.);
+
+            let mut text_layout = self
+                .platform_text_system
+                .layout_line(&text, font_size, runs);
+            let mut inline_boxes_ascent = text_layout.ascent;
+
+            let mut global_glyph_ix = 0;
+            // Adjust glyph positions to accommodate inline boxes
+            for run in text_layout.runs.iter_mut() {
+                let mut current_inline_box = inline_boxes_iter.peek();
+
+                for glyph in run.glyphs.iter_mut() {
+                    while let Some(inline_box) = current_inline_box {
+                        if inline_box.glyph_ix == global_glyph_ix {
+                            inline_boxes_width += inline_box.size.width;
+                            inline_boxes_ascent = inline_boxes_ascent
+                                .max(inline_box.size.height + text_layout.ascent);
+                            inline_boxes_iter.next();
+                        } else {
+                            break;
+                        }
+
+                        current_inline_box = inline_boxes_iter.peek();
+                    }
+
+                    glyph.position.x += inline_boxes_width;
+                    global_glyph_ix += 1;
+                }
+            }
+            text_layout.width += inline_boxes_width;
+
+            let layout = Arc::new(text_layout);
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
+                inline_boxes: SmallVec::from(inline_boxes),
                 wrap_width: None,
             });
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -590,6 +675,7 @@ struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
+    inline_boxes: SmallVec<[InlineBox; 1]>,
     wrap_width: Option<Pixels>,
 }
 
@@ -598,6 +684,7 @@ struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
     runs: &'a [FontRun],
+    inline_boxes: &'a [InlineBox],
     wrap_width: Option<Pixels>,
 }
 
@@ -621,6 +708,7 @@ impl AsCacheKeyRef for CacheKey {
             text: &self.text,
             font_size: self.font_size,
             runs: self.runs.as_slice(),
+            inline_boxes: self.inline_boxes.as_slice(),
             wrap_width: self.wrap_width,
         }
     }
