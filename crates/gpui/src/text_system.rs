@@ -411,6 +411,7 @@ impl WindowTextSystem {
         text: SharedString,
         font_size: Pixels,
         runs: &[TextRun],
+        inline_boxes: Option<&[InlineBox]>,
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
@@ -478,6 +479,7 @@ impl WindowTextSystem {
                 &line_text,
                 font_size,
                 &font_runs,
+                inline_boxes,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
             );
@@ -587,6 +589,7 @@ impl WindowTextSystem {
             &SharedString::new(text),
             font_size,
             &font_runs,
+            &[],
             force_width,
         );
 
