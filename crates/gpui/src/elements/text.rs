@@ -1,9 +1,10 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
-    register_tooltip_mouse_handlers, set_tooltip_on_window,
+    ActiveTooltip, AnyElement, AnyView, App, AvailableSpace, Bounds, DispatchPhase, Element,
+    ElementId, GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InlineBox,
+    InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, SharedString, Size, Style, TextOverflow, TextRun, TextStyle, TooltipId,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, point, px, register_tooltip_mouse_handlers,
+    set_tooltip_on_window, size,
 };
 use anyhow::Context as _;
 use smallvec::SmallVec;
@@ -36,7 +37,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, None, window, cx);
         (layout_id, state)
     }
 
@@ -102,7 +103,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, None, window, cx);
         (layout_id, state)
     }
 
@@ -255,7 +256,9 @@ impl Element for StyledText {
             })
         });
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id = self
+            .layout
+            .layout(self.text.clone(), runs, None, window, cx);
         (layout_id, ())
     }
 
@@ -311,6 +314,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        inline_boxes: Option<Vec<InlineBox>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -364,11 +368,16 @@ impl TextLayout {
                     }
                 }
 
+                let inline_boxes_width = inline_boxes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .fold(px(0.), |width, b| width + b.size.width);
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let text = if let Some(truncate_width) = truncate_width {
                     line_wrapper.truncate_line(
                         text.clone(),
-                        truncate_width,
+                        truncate_width - inline_boxes_width,
                         &truncation_suffix,
                         &mut runs,
                     )
@@ -383,6 +392,7 @@ impl TextLayout {
                         text,
                         font_size,
                         &runs,
+                        inline_boxes.as_deref(),
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                     )
@@ -403,7 +413,7 @@ impl TextLayout {
                 for line in &lines {
                     let line_size = line.size(line_height);
                     size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
+                    size.width = size.width.max(line_size.width + inline_boxes_width).ceil();
                 }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
@@ -466,6 +476,59 @@ impl TextLayout {
             .log_err();
             line_origin.y += line.size(line_height).height;
         }
+    }
+
+    /// Get the position of a specified inline box index.
+    pub fn position_of_inline_box(&self, index: usize) -> Option<Point<Pixels>> {
+        let element_state = self.0.borrow_mut();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        for line in &element_state.lines {
+            if let Some(inline_box) = line.inline_boxes.get(index) {
+                let byte_index = line
+                    .text
+                    .char_indices()
+                    .nth(inline_box.glyph_ix)
+                    .map(|(ix, _)| ix)
+                    .unwrap_or(line.len());
+
+                let mut inline_items_width = px(0.);
+                if line.len() == byte_index {
+                    for ib in line.inline_boxes[..index].iter().rev() {
+                        if ib.glyph_ix == inline_box.glyph_ix {
+                            inline_items_width += ib.size.width;
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    for ib in line.inline_boxes.iter().skip(index) {
+                        if ib.glyph_ix == inline_box.glyph_ix {
+                            inline_items_width -= ib.size.width;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let origin = line.position_for_index(byte_index, line_height);
+
+                if let Some(origin) = origin {
+                    return Some(point(
+                        bounds.origin.x + origin.x + inline_items_width,
+                        bounds.origin.y + origin.y - inline_box.size.height,
+                    ));
+                }
+            }
+        }
+
+        None
     }
 
     /// Get the byte index into the input of the pixel position.
@@ -896,6 +959,149 @@ impl Element for InteractiveText {
 }
 
 impl IntoElement for InteractiveText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A text element that can have inline elements.
+pub struct InlineText {
+    layout: TextLayout,
+    text: SharedString,
+    inline_items: Vec<(Box<dyn FnMut(&mut Window) -> AnyElement>, InlineBox)>,
+}
+
+impl InlineText {
+    /// Create a new `InlineText``.
+    pub fn new() -> Self {
+        InlineText {
+            layout: TextLayout::default(),
+            text: SharedString::new(""),
+            inline_items: Vec::new(),
+        }
+    }
+
+    /// Add a text run to the `InlineText``.
+    pub fn add_text(mut self, text: impl Into<SharedString>) -> Self {
+        self.text = SharedString::from(format!("{}{}", self.text, text.into()));
+        self
+    }
+
+    /// Add a element run to the `InlineText``.
+    pub fn add_element<R>(mut self, element: R) -> Self
+    where
+        R: 'static + FnMut(&mut Window) -> AnyElement,
+    {
+        self.inline_items.push((
+            Box::new(element),
+            InlineBox {
+                glyph_ix: self.text.chars().count(),
+                size: Size::default(),
+            },
+        ));
+        self
+    }
+}
+
+/// The layout state that is created when layouting `InlineText`.
+pub struct InlineTextLayoutState {
+    inline_elements: Vec<AnyElement>,
+}
+
+impl Element for InlineText {
+    type RequestLayoutState = InlineTextLayoutState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        app: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut inline_elements = Vec::new();
+        let mut inline_boxes = Vec::new();
+
+        for inline_element in &mut self.inline_items {
+            let mut element = inline_element.0(window);
+            let layout_id = element.request_layout(window, app);
+
+            window.compute_layout(
+                layout_id,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                app,
+            );
+            let inline_element_bounds = window.layout_bounds(layout_id);
+
+            inline_elements.push(element);
+            let mut inline_box = inline_element.1.clone();
+            inline_box.size = inline_element_bounds.size;
+
+            inline_boxes.push(inline_box);
+        }
+
+        let text_layout_id =
+            self.layout
+                .layout(self.text.clone(), None, Some(inline_boxes), window, app);
+
+        let style = Style::default();
+        (
+            window.request_layout(style, [text_layout_id], app),
+            Self::RequestLayoutState { inline_elements },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        app: &mut App,
+    ) -> Self::PrepaintState {
+        self.layout.prepaint(bounds, &self.text);
+
+        for (idx, inline_element) in request_layout.inline_elements.iter_mut().enumerate() {
+            let origin = self.layout.position_of_inline_box(idx);
+
+            if let Some(origin) = origin {
+                inline_element.prepaint_at(origin, window, app);
+            }
+        }
+
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        app: &mut App,
+    ) {
+        self.layout.paint(&self.text, window, app);
+
+        for inline_element in &mut request_layout.inline_elements {
+            inline_element.paint(window, app);
+        }
+    }
+}
+
+impl IntoElement for InlineText {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {

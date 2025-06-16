@@ -1824,6 +1824,7 @@ impl Interactivity {
                         &[window.text_style().to_run(str_len)],
                         None,
                         None,
+                        None,
                     )
                     .ok()
                     .and_then(|mut text| text.pop())

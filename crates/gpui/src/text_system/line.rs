@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
-    TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px,
-    size,
+    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, Size,
+    StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black,
+    fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -75,6 +75,7 @@ impl ShapedLine {
             None,
             &self.decoration_runs,
             &[],
+            &[],
             window,
             cx,
         )?;
@@ -141,11 +142,12 @@ impl WrappedLine {
 
         paint_line(
             origin,
-            &self.layout.unwrapped_layout,
+            &self.unwrapped_layout,
             line_height,
             align,
             align_width,
             &self.decoration_runs,
+            &self.inline_boxes,
             &self.wrap_boundaries,
             window,
             cx,
@@ -185,6 +187,15 @@ impl WrappedLine {
     }
 }
 
+/// An Inline Box used in text layouts.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct InlineBox {
+    /// The glyph index just after the inline box
+    pub glyph_ix: usize,
+    /// The size of the inline box
+    pub size: Size<Pixels>,
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -192,6 +203,7 @@ fn paint_line(
     align: TextAlign,
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
+    inline_boxes: &[InlineBox],
     wrap_boundaries: &[WrapBoundary],
     window: &mut Window,
     cx: &mut App,
@@ -204,9 +216,8 @@ fn paint_line(
         ),
     );
     window.paint_layer(line_bounds, |window| {
-        let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
-        let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let mut decoration_runs = decoration_runs.iter();
+        let mut inline_boxes = inline_boxes.iter().peekable();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut color = black();
@@ -227,6 +238,20 @@ fn paint_line(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        let mut height = line_height;
+
+        let next_wrap = wraps.peek();
+        while let Some(inline_box) = inline_boxes.peek() {
+            if let Some(next_wrap) = next_wrap {
+                if inline_box.glyph_ix > next_wrap.glyph_ix {
+                    break;
+                }
+            }
+
+            height = height.max(inline_box.size.height);
+            inline_boxes.next();
+        }
+
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -273,9 +298,27 @@ fn paint_line(
                         layout,
                         wraps.peek(),
                     );
-                    glyph_origin.y += line_height;
+
+                    glyph_origin.y += height;
+                    height = line_height;
+
+                    let next_wrap = wraps.peek();
+                    while let Some(inline_box) = inline_boxes.peek() {
+                        if let Some(next_wrap) = next_wrap {
+                            if inline_box.glyph_ix > next_wrap.glyph_ix {
+                                break;
+                            }
+                        }
+
+                        height = height.max(inline_box.size.height);
+                        inline_boxes.next();
+                    }
                 }
                 prev_glyph_position = glyph.position;
+
+                let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
+                let mut baseline_offset =
+                    point(px(0.), padding_top + height - line_height + layout.ascent);
 
                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
                 let mut finished_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
