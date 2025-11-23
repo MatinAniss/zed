@@ -275,6 +275,13 @@ impl<C: RenderOnce> IntoElement for Component<C> {
 #[derive(Deref, DerefMut, Clone, Default, Debug, Eq, PartialEq, Hash)]
 pub struct GlobalElementId(pub(crate) Arc<[ElementId]>);
 
+impl GlobalElementId {
+    /// Create a new `GlobalElementId` with the given element ID stack.
+    pub fn new(stack: Arc<[ElementId]>) -> Self {
+        GlobalElementId(stack)
+    }
+}
+
 impl Display for GlobalElementId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, element_id) in self.0.iter().enumerate() {
